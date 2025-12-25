@@ -1,0 +1,272 @@
+<?php
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+class Cirrusly_Commerce_Core {
+
+    public function __construct() {
+        $this->load_dependencies();
+        $this->define_hooks();
+    }
+
+    private function load_dependencies() {
+        // Utilities (Always needed)
+        require_once plugin_dir_path( __FILE__ ) . 'class-security.php';
+        require_once plugin_dir_path( __FILE__ ) . 'class-reports.php';
+        if ( file_exists( plugin_dir_path( __FILE__ ) . 'class-gmc.php' ) ) {
+            require_once plugin_dir_path( __FILE__ ) . 'class-gmc.php';
+        }
+        if ( file_exists( plugin_dir_path( __FILE__ ) . 'class-audit.php' ) ) {
+            require_once plugin_dir_path( __FILE__ ) . 'class-audit.php';
+        }
+
+        // Admin-Specific Loading
+        if ( is_admin() ) {
+            require_once plugin_dir_path( __FILE__ ) . 'admin/class-admin-assets.php';
+            require_once plugin_dir_path( __FILE__ ) . 'admin/class-settings-manager.php';
+            require_once plugin_dir_path( __FILE__ ) . 'admin/class-dashboard-ui.php';
+            
+            // Remote announcements system
+            if ( file_exists( plugin_dir_path( __FILE__ ) . 'class-announcements.php' ) ) {
+                require_once plugin_dir_path( __FILE__ ) . 'class-announcements.php';
+                Cirrusly_Commerce_Announcements::init();
+            }
+        }
+
+        // Pro-Only Loading
+        if ( self::cirrusly_is_pro() && file_exists( plugin_dir_path( __FILE__ ) . 'pro/class-google-api-client.php' ) ) {
+            require_once plugin_dir_path( __FILE__ ) . 'pro/class-google-api-client.php';
+        }
+
+        // Freemius Webhook Handler (Pro) - REST API endpoint for license events
+        if ( self::cirrusly_is_pro() && file_exists( plugin_dir_path( __FILE__ ) . 'pro/class-freemius-webhook.php' ) ) {
+            require_once plugin_dir_path( __FILE__ ) . 'pro/class-freemius-webhook.php';
+            Cirrusly_Commerce_Freemius_Webhook::init();
+        }
+
+        // API Key Migration Notice (Pro, Admin only) - One-time notice for manual key users
+        if ( is_admin() && self::cirrusly_is_pro() && file_exists( plugin_dir_path( __FILE__ ) . 'admin/class-api-key-migration-notice.php' ) ) {
+            require_once plugin_dir_path( __FILE__ ) . 'admin/class-api-key-migration-notice.php';
+            Cirrusly_Commerce_API_Key_Migration_Notice::init();
+        }
+
+        // GMC Analytics (Pro Plus) - Only load for admin or cron (needed for AJAX + daily sync)
+        if ( self::cirrusly_is_pro_plus() && ( is_admin() || wp_doing_cron() ) && file_exists( plugin_dir_path( __FILE__ ) . 'pro/class-gmc-analytics.php' ) ) {
+            require_once plugin_dir_path( __FILE__ ) . 'pro/class-gmc-analytics.php';
+            new Cirrusly_Commerce_GMC_Analytics();
+        }
+    }
+
+    /**
+         * Register core actions, filters, and initialize optional integration and admin components.
+         *
+         * Initializes optional integrations (Audit, Reports, GMC) when present, instantiates and
+         * registers admin-only managers and UI when in the admin context, and registers core
+         * actions and filters used by the plugin (AJAX audit save, scheduled GMC scan router,
+         * product save metrics cache clearing, and the pre-option filter that enables cost-of-goods).
+         *
+         * @return void
+         */
+        private function define_hooks() {
+        if ( class_exists( 'Cirrusly_Commerce_Audit' ) ) {
+            add_action('init', array('Cirrusly_Commerce_Audit', 'init'));
+        }
+        
+        // Reports (Weekly Email)
+        if ( class_exists( 'Cirrusly_Commerce_Reports' ) ) {
+            Cirrusly_Commerce_Reports::init();
+        }
+
+        // 1. Initialize GMC Core (This registers the hooks ONCE)
+        if ( class_exists( 'Cirrusly_Commerce_GMC' ) ) {
+            $gmc = new Cirrusly_Commerce_GMC();
+            $gmc->init();
+        }
+
+        // 2. Existing Admin Hooks
+        if ( is_admin() ) {
+            $settings = new Cirrusly_Commerce_Settings_Manager();
+            $assets   = new Cirrusly_Commerce_Admin_Assets();
+            $dash     = new Cirrusly_Commerce_Dashboard_UI();
+
+            add_action( 'admin_menu', array( $settings, 'register_admin_menus' ) );
+            add_action( 'admin_init', array( $settings, 'register_settings' ) );
+            add_action( 'admin_enqueue_scripts', array( $assets, 'enqueue' ) );
+            add_action( 'wp_dashboard_setup', array( $dash, 'register_widget' ) );
+            add_action( 'admin_notices', array( $settings, 'render_onboarding_notice' ) );
+        }
+
+        add_action( 'wp_ajax_cirrusly_audit_save', array( $this, 'handle_audit_inline_save' ) );
+        add_action( 'cirrusly_gmc_daily_scan', array( $this, 'execute_scheduled_scan_router' ) );
+        add_action( 'save_post_product', array( $this, 'clear_metrics_cache' ) );
+        // FIX: Renamed option filter to avoid using 'woocommerce' prefix
+        add_filter( 'pre_option_cirrusly_enable_cost_of_goods_sold', function() {
+            return 'yes';
+        } );
+    }
+
+    /**
+     * Triggers a scheduled Google Merchant Center scan when the Google API client is available.
+     *
+     * If the Cirrusly_Commerce_Google_API_Client class is not present, this method does nothing.
+     */
+    public function execute_scheduled_scan_router() {
+        if ( class_exists('Cirrusly_Commerce_Google_API_Client') ) {
+            Cirrusly_Commerce_Google_API_Client::execute_scheduled_scan();
+        }
+    }
+
+    /**
+     * Handle an AJAX request to save inline audit fields for a product.
+     *
+     * Validates the current user's capability and the request nonce, and requires the plugin's Pro mode.
+     * Reads `pid`, `value`, and `field` from POST and, when `pid` is greater than zero and `field` is one of
+     * `_cogs_total_value` or `_cirrusly_est_shipping`, updates the corresponding post meta and clears the
+     * `cirrusly_audit_data` transient before returning a JSON success response. On validation failure or
+     * invalid input, returns a JSON error with an explanatory message.
+     */
+    public function handle_audit_inline_save() {
+        // Updated to use 'cirrusly_audit_save' to match class-admin-assets.php creation
+        if ( ! current_user_can( 'edit_products' ) || ! check_ajax_referer( 'cirrusly_audit_save', '_nonce', false ) ) {
+            wp_send_json_error( __( 'Permission denied', 'cirrusly-commerce' ) );
+        }
+        if ( ! self::cirrusly_is_pro() ) wp_send_json_error( __( 'Pro feature required', 'cirrusly-commerce' ) );
+
+        // Updated validation with isset check, unslash, and sanitization
+        $pid   = isset( $_POST['pid'] ) ? intval( wp_unslash( $_POST['pid'] ) ) : 0;
+        $val   = isset( $_POST['value'] ) ? floatval( wp_unslash( $_POST['value'] ) ) : 0.0;
+        $field = isset( $_POST['field'] ) ? sanitize_text_field( wp_unslash( $_POST['field'] ) ) : '';
+
+        if ( $pid > 0 && current_user_can( 'edit_post', $pid )
+            && in_array( $field, array( '_cogs_total_value', '_cirrusly_est_shipping' ), true ) ) {
+            update_post_meta( $pid, $field, $val );
+            delete_transient( 'cirrusly_audit_data' );
+            wp_send_json_success();
+        }
+        wp_send_json_error( __( 'Invalid data', 'cirrusly-commerce' ) );
+    }
+
+    public function clear_metrics_cache() {
+        delete_transient( 'cirrusly_dashboard_metrics' );
+        
+        // Invalidate all analytics P&L transients by updating the version key.
+        // This avoids direct DB DELETE queries on the options table, which are incompatible
+        // with object caching (Redis/Memcached) and flagged as "Direct database call without caching".
+        update_option( 'cirrusly_analytics_cache_version', time(), false );
+    }
+
+    public static function cirrusly_is_pro() {
+        // 1. Secure Developer Override
+        // FIX: Check if wp_get_current_user exists before calling current_user_can to prevent early load crash
+        if ( defined('WP_DEBUG') && WP_DEBUG && function_exists('wp_get_current_user') && current_user_can('manage_options') ) {
+            if ( isset( $_GET['cirrusly_dev_mode'] ) ) {
+                $mode = sanitize_key( wp_unslash( $_GET['cirrusly_dev_mode'] ) );
+                if ( $mode === 'pro' ) return true;
+                if ( $mode === 'free' ) return false;
+            }
+        }
+
+        // 2. Freemius Check
+        if ( function_exists( 'cirrusly_fs' ) ) {
+             return cirrusly_fs()->can_use_premium_code();
+        }
+
+        return false;
+    }
+
+    public static function cirrusly_is_pro_plus() {
+        // 1. Dev Mode Override (useful for testing)
+        if ( defined('WP_DEBUG') && WP_DEBUG && function_exists('wp_get_current_user') && current_user_can('manage_options') ) {
+            if ( isset( $_GET['cirrusly_dev_mode'] ) ) {
+                $mode = sanitize_key( wp_unslash( $_GET['cirrusly_dev_mode'] ) );
+                if ( $mode === 'pro_plus' ) return true;
+            }
+        }
+
+        // 2. Freemius Check
+        if ( function_exists( 'cirrusly_fs' ) ) {
+            // Check if user is on 'proplus' plan (OR higher, if more tiers are added later).
+            return cirrusly_fs()->is_plan( 'proplus' );
+        }
+
+        return false;
+    }
+
+    public static function get_email_from_header() {
+        $admin_email = get_option( 'admin_email' );
+        $site_title  = wp_specialchars_decode( get_option( 'blogname' ), ENT_QUOTES );
+        return array( 'From: ' . $site_title . ' <' . $admin_email . '>' );
+    }
+
+    public function get_global_config() {
+        $saved = get_option( 'cirrusly_shipping_config' );
+        $defaults = array(
+            'revenue_tiers_json' => json_encode(array(
+                array( 'min' => 0,     'max' => 10.00, 'charge' => 3.99 ),
+                array( 'min' => 10.01, 'max' => 20.00, 'charge' => 4.99 ),
+                array( 'min' => 60.00, 'max' => 99999, 'charge' => 0.00 ),
+            )),
+            'matrix_rules_json' => json_encode(array(
+                'economy'   => array( 'key'=>'economy',   'label' => 'Eco',      'cost_mult' => 1.0 ),
+                'standard'  => array( 'key'=>'standard',  'label' => 'Std',      'cost_mult' => 1.4 ),
+                'twoday'    => array( 'key'=>'twoday',    'label' => '2Day',     'cost_mult' => 2.5 ),
+                'overnight' => array( 'key'=>'overnight', 'label' => 'Over',     'cost_mult' => 5.0 ),
+            )),
+            'class_costs_json' => json_encode(array('default' => 10.00)),
+            'payment_pct' => 2.9,
+            'payment_flat' => 0.30,
+            'profile_mode' => 'single',
+            'payment_pct_2' => 3.49,
+            'payment_flat_2' => 0.49,
+            'profile_split' => 100
+        );
+        return wp_parse_args( $saved, $defaults );
+    }
+
+    public static function render_global_header( $title ) {
+        self::render_page_header( $title );
+    }
+
+    public static function render_page_header( $title ) {
+        $is_pro = self::cirrusly_is_pro();
+
+        echo '<h1 class="cirrusly-page-title" style="margin-bottom:20px; display:flex; align-items:center;">';
+        echo '<img src="' . esc_url( CIRRUSLY_COMMERCE_URL . 'assets/images/logo.svg' ) . '" style="height:50px; width:auto; margin-right:15px;" alt="Cirrusly Commerce">';
+        echo esc_html( $title );
+        echo '<div style="margin-left:auto; display:flex; align-items:center; gap:10px;">';
+        
+        if ( $is_pro ) {
+            echo '<span class="cirrusly-pro-version-badge">PRO</span>';
+        }
+        
+        if ( class_exists( 'Cirrusly_Commerce_Help' ) ) {
+            Cirrusly_Commerce_Help::render_button();
+        }
+
+        echo '<span class="cirrusly-ver-badge" style="background:#f0f0f1;color:#646970;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;">v' . esc_html( CIRRUSLY_COMMERCE_VERSION ) . '</span>';
+        echo '</div></h1>';
+        
+        $current_page = isset( $_GET['page'] ) ? sanitize_text_field( wp_unslash( $_GET['page'] ) ) : '';
+        
+        // Define Base Nav Items with I18n
+        $nav_items = array(
+            'cirrusly-commerce' => __( 'Dashboard', 'cirrusly-commerce' ),
+        );
+
+        // Add Analytics for Pro Plus users (inserted second)
+        if ( self::cirrusly_is_pro_plus() ) {
+            $nav_items['cirrusly-analytics'] = __( 'Analytics', 'cirrusly-commerce' );
+        }
+
+        // Add remaining items
+        $nav_items['cirrusly-gmc']   = __( 'Compliance Hub', 'cirrusly-commerce' );
+        $nav_items['cirrusly-audit'] = __( 'Financial Audit', 'cirrusly-commerce' );
+        $nav_items['cirrusly-settings'] = __( 'Settings', 'cirrusly-commerce' );
+
+        echo '<div class="cirrusly-global-nav">';
+        foreach ( $nav_items as $slug => $label ) {
+            $active_class = ( $current_page === $slug ) ? 'cirrusly-nav-active' : '';
+            echo '<a href="' . esc_url( admin_url( 'admin.php?page=' . $slug ) ) . '" class="' . esc_attr( $active_class ) . '">' . esc_html( $label ) . '</a>';
+        }
+        echo '</div>';
+    }
+}

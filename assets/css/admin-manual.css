@@ -1,0 +1,55 @@
+/**
+ * Cirrusly Commerce - Manual Page Styles
+ * Extracted from inline styles for cleaner markup and better maintainability
+ */
+
+/* Main container */
+.cc-manual-container {
+    max-width: 1200px;
+    margin-top: 20px;
+    padding: 0;
+}
+
+/* Grid layout */
+.cc-manual-grid {
+    display: flex;
+}
+
+/* Sidebar */
+.cc-manual-sidebar {
+    width: 250px;
+    background: #f0f6fc;
+    padding: 20px;
+    border-right: 1px solid #dcdcde;
+}
+
+.cc-manual-sidebar h3 {
+    margin-top: 0;
+    font-size: 1.1em;
+    color: #1d2327;
+}
+
+.cc-manual-sidebar ul {
+    margin: 0;
+    list-style: none;
+    line-height: 2;
+}
+
+.cc-manual-sidebar a {
+    text-decoration: none;
+}
+
+/* Content area */
+.cc-manual-content {
+    flex: 1;
+    padding: 40px;
+}
+
+/* Section spacing */
+.cc-manual-section {
+    margin-bottom: 50px;
+}
+
+.cc-manual-section h2 {
+    margin-top: 0;
+}
